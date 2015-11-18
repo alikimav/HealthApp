@@ -1,0 +1,138 @@
+---
+title: "Apple's Health App"
+subtitle: "importing health app data in R"
+output: html_document
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+## Introduction
+In this `R` markdown document, we show how to export the data from Apple's Health App and read into R for further analysis. 
+
+To export the data, go to
+
+**Health --> Health Data --> All** 
+
+and press the export icon at the top right. A .zip folder containing the data may be sent as an email attachment.
+
+Unzip and keep the *export.xml* file in the working directory.
+
+### Libraries
+```{r, echo = TRUE, warning=FALSE, message=FALSE}
+library(XML)
+library(plyr)
+library(dplyr)
+library(tools)
+library(chron)
+library(qdap)
+library(ggplot2)
+```
+
+## About the data
+
+The data is in XML format; as it is, the XML includes insignificant white space. Prior to using `R`'s XML parser, we replace the white space with the linefeed (`\n`) character.
+
+```{r, results = 'hide'}
+filename <- readLines("./export.xml")
+xmltext <- paste(filename, "\n", collapse = "")
+doc1 <- xmlTreeParse(xmltext, asText = TRUE)
+```
+
+Using `xmlToList`, the XML document is converted to an `R`-like list with the following elements/components:
+
+1) **ExportDate**: gives the date and time the data was exported from the Health App
+2) **Me**: information on DoB, Biological Sex, Blood Type, and Fitzpatrick Skin Type ^[I took the test, I am quite likely a Type III. <https://en.wikipedia.org/wiki/Fitzpatrick_scale>]
+3) **Record**: there are several "Record" elements in the data; the items within each element vary but all elements typically include columns for *type*, *source*, *creationDate*, perhaps *value* and *unit* if numeric, etc.
+
+```{r, echo = TRUE, results='hide'}
+data <- xmlToList(doc1)
+```
+
+### The **Me** component
+
+We first extract information on the **Me** component. The variable `data` is a list from which we extract the data frame matching the **Me** component. We also rename some of the variable names to tidy up the data, specifically by removing parts of the names that provide no added clarification. The resulting data frame `dataMe` gives information about the subject.
+
+```{r, echo = TRUE, results='hide'}
+dfid <- as.data.frame(data[names(data) == "Me"])
+dataMe <- as.data.frame(t(dfid))
+colnames(dataMe) <- gsub(".*Identifier", "", colnames(dataMe))
+dataMe$DateOfBirth <- strptime(dataMe$DateOfBirth, '%Y%m%d')
+```
+
+
+### The **Record** components
+
+We now focus on the "Record" components in the data list; `dfrecords` is a list of data frames that matches the "Record" category in the exported data.
+
+```{r, echo = TRUE, results='hide' }
+dfrecords <- data[names(data) == "Record"]
+```
+
+At this point we would like to create a data frame comprising of all items in each record component. The reason for this is that so we can then group those records which are, for instance, under the same type and analyze the observations belonging to each type of collected data. 
+
+We would normally proceed with `rbind` but, since not all of the elements in the `dfrecords` list contain the same items, we make use of `rbind.fill`. The latter function row binds a list of data frames and creates columns with all `NA` values to any inputs that are missing. Here, "missing inputs" correspond to items which may be present for certain list elements but not others. 
+
+This is just a quick fix to obtain a data frame of all the records in the exported data; we deal with the redundant columns that were added as a result of the `rbind.fill` command later on.
+
+```{r, echo = TRUE, results='hide' }
+dfrecords0 <- rbind.fill(lapply(dfrecords,function(x){as.data.frame(t(x),stringsAsFactors=FALSE)}))
+# clean up variable names for tidier data
+dfrecords <- as.data.frame(sapply(dfrecords0,gsub,pattern=".*Identifier|^HK",replacement=""))
+names(dfrecords) <- gsub("^HK", "", names(dfrecords))
+```
+
+The resulting data frame, `dfrecords` contains the information from Health's data in an `R` data frame. The different types of collected data from the app are the following:
+
+`r unique(dfrecords$type)`
+
+#### Cleaning up the dates
+
+An example of the date format extracted from the data is `r dfrecords$creationDate[1]`, which is of class "character". Next, we convert the date/time variables to a more appropriate, date-like format. First, we use `strptime` to convert the character vector in the *date* columns (these are `creationDate`, `startDate`, and `endDate`) into a  `"POSIXlt" "POSIXt"` object.
+
+```{r, echo = TRUE, results = 'hide'}
+for(col in c("creationDate", "startDate", "endDate")){
+   dfrecords[, col] <- list(strptime(dfrecords[, col], format = "%Y%m%d%H%M%S"))
+    }
+```
+
+The format for `creationDate`, `startDate`, and `endDate` include the date, time, and time zone in a single variable. Next, we use the `mutate` function to create variables that split the date, time, and time zone given by three different variables. We then remove the old date variables from the resulting data frame.   
+
+```{r, echo = TRUE, results = 'hide'}
+dfrecords <- mutate(dfrecords, creationdate = as.Date(creationDate),
+                  creationtime = strftime(creationDate,format = "%H:%M:%S"), 
+                  startdate = as.Date(startDate),
+                  starttime = chron(times = strftime(startDate,format = "%H:%M:%S")),
+                  #enddate = as.Date(endDate),
+                  endtime = chron(times = strftime(endDate,format = "%H:%M:%S")),
+                  timezone = strftime(creationDate,format = "%Z"))
+
+dfrecords2 <- dplyr::select(dfrecords, -matches("Date", ignore.case = FALSE))
+```
+
+
+An example of the new format for creation date, time, and time zone variables is given as `r dfrecords2$creationdate[1]`, `r dfrecords2$creationtime[1]`, and `r dfrecords2$timezone[1]`, respectively. 
+
+#### Column classes
+
+We note that apart from the date/time variables we have just changed, all other columns are of class "character". We now proceed to convert those columns that contain numeric values to "numeric" (note these columns may be different depending on the exported data and any additional apps that may be linked to the Health app). 
+
+```{r, echo = TRUE, results='hide'}
+for(var in c("value", "min", "max", "average")){
+  dfrecords2[, var] <- as.numeric(dfrecords2[, var])
+}
+```
+
+### Final data frame list
+
+Currently, in the data frame `dfrecords2`, the *type* of record is a variable; we proceed to create a list of data frames broken down by *record type*.
+
+```{r, echo = TRUE, results = 'hide'}
+listdf <- split(dfrecords2, dfrecords2$type)
+```
+
+Now, the list `listdf` gives a list of dataframes broken down by elements according to `type`. Within each element, we have the same items as a result of `rbind.fill` which was used above. To tidy up the final list, in each element, we remove those columns which are entirely made up of NA values. This is achieved using `funprog`'s `Filter` command from the base library. 
+
+```{r, echo = TRUE, results = 'hide'}
+listdf2 <- sapply(listdf, function(x) base::Filter(function(y)!all(is.na(y)), x))
+```
+
+The list `listdf2` contains data frames corresponding to the following types: `r names(listdf2)`. 
